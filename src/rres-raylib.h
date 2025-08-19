@@ -528,14 +528,16 @@ Mesh LoadMeshFromResource(rresResourceMulti multi)
 // In case data could not be processed by rres.h, it is just copied in chunk.data.raw for processing here
 // NOTE 1: Function return 0 on success or an error code on failure
 // NOTE 2: Data corruption CRC32 check has already been performed by rresLoadResourceMulti() on rres.h
+// Unpack compressed/encrypted data from resource chunk
+// Returns 0 on success, error code on failure
 int UnpackResourceChunk(rresResourceChunk *chunk)
 {
     int result = 0;
     bool updateProps = false;
     void *unpackedData = NULL;
-
     unsigned char *decryptedData = NULL;
 
+    // --- Decryption ---
     switch (chunk->info.cipherType)
     {
     case RRES_CIPHER_NONE:
@@ -549,7 +551,7 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         {
             result = 2;
             break;
-        }
+        } // sanity
 
         int dataSize = chunk->info.packedSize - 32;
         decryptedData = (unsigned char *)RL_CALLOC(dataSize, 1);
@@ -580,23 +582,25 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         struct AES_ctx ctx;
         AES_init_ctx(&ctx, key);
         AES_CTR_xcrypt_buffer(&ctx, decryptedData, dataSize);
-
         crypto_wipe(key, 32);
 
         unsigned int decryptMD5[4];
-        ComputeMD5(decryptedData, dataSize, decryptMD5); // Corrected function call
+        unsigned int *md5Ptr = ComputeMD5(decryptedData, dataSize);
+        memcpy(decryptMD5, md5Ptr, sizeof(decryptMD5));
 
         if (memcmp(decryptMD5, md5, sizeof(md5)) == 0)
         {
             chunk->info.packedSize = dataSize;
             RRES_LOG("RRES: %c%c%c%c: Data decrypted successfully (AES)\n",
-                     chunk->info.type[0], chunk->info.type[1], chunk->info.type[2], chunk->info.type[3]);
+                     chunk->info.type[0], chunk->info.type[1],
+                     chunk->info.type[2], chunk->info.type[3]);
         }
         else
         {
             result = 2;
             RRES_LOG("RRES: WARNING: %c%c%c%c: Data decryption failed, wrong password or corrupted data\n",
-                     chunk->info.type[0], chunk->info.type[1], chunk->info.type[2], chunk->info.type[3]);
+                     chunk->info.type[0], chunk->info.type[1],
+                     chunk->info.type[2], chunk->info.type[3]);
         }
     }
     break;
@@ -609,9 +613,9 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         {
             result = 2;
             break;
-        } // sanity check
+        }
 
-        int dataSize = chunk->info.packedSize - 16 - 24 - 16; // salt + nonce + MAC
+        int dataSize = chunk->info.packedSize - 16 - 24 - 16;
         decryptedData = (unsigned char *)RL_CALLOC(dataSize, 1);
         if (!decryptedData)
         {
@@ -645,13 +649,15 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         {
             chunk->info.packedSize = dataSize;
             RRES_LOG("RRES: %c%c%c%c: Data decrypted successfully (XChaCha20)\n",
-                     chunk->info.type[0], chunk->info.type[1], chunk->info.type[2], chunk->info.type[3]);
+                     chunk->info.type[0], chunk->info.type[1],
+                     chunk->info.type[2], chunk->info.type[3]);
         }
         else
         {
             result = 2;
             RRES_LOG("RRES: WARNING: %c%c%c%c: Data decryption failed, wrong password or corrupted data\n",
-                     chunk->info.type[0], chunk->info.type[1], chunk->info.type[2], chunk->info.type[3]);
+                     chunk->info.type[0], chunk->info.type[1],
+                     chunk->info.type[2], chunk->info.type[3]);
         }
     }
     break;
@@ -660,7 +666,8 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
     default:
         result = 1;
         RRES_LOG("RRES: WARNING: %c%c%c%c: Chunk data encryption algorithm not supported\n",
-                 chunk->info.type[0], chunk->info.type[1], chunk->info.type[2], chunk->info.type[3]);
+                 chunk->info.type[0], chunk->info.type[1],
+                 chunk->info.type[2], chunk->info.type[3]);
         break;
     }
 
@@ -670,7 +677,7 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         updateProps = true;
     }
 
-    // Decompression
+    // --- Decompression ---
     unsigned char *uncompData = NULL;
     if (result == 0)
     {
@@ -679,6 +686,7 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         case RRES_COMP_NONE:
             unpackedData = decryptedData;
             break;
+
         case RRES_COMP_DEFLATE:
         {
             int uncompDataSize = 0;
@@ -688,12 +696,14 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
                 unpackedData = uncompData;
                 chunk->info.packedSize = uncompDataSize;
                 RRES_LOG("RRES: %c%c%c%c: Data decompressed successfully (DEFLATE)\n",
-                         chunk->info.type[0], chunk->info.type[1], chunk->info.type[2], chunk->info.type[3]);
+                         chunk->info.type[0], chunk->info.type[1],
+                         chunk->info.type[2], chunk->info.type[3]);
             }
             else
                 result = 4;
         }
         break;
+
 #if defined(RRES_SUPPORT_COMPRESSION_LZ4)
         case RRES_COMP_LZ4:
         {
@@ -723,23 +733,31 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         updateProps = true;
     }
 
-    // Update props
+    // --- Update props ---
     if (updateProps && unpackedData)
     {
-        chunk->data.propCount = ((int *)unpackedData)[0];
-        if (chunk->data.propCount > 0)
+        unsigned int propCount = 0;
+        memcpy(&propCount, unpackedData, sizeof(propCount));
+        chunk->data.propCount = propCount;
+
+        if (propCount > 0)
         {
-            chunk->data.props = (unsigned int *)RRES_CALLOC(chunk->data.propCount, sizeof(int));
-            for (unsigned int i = 0; i < chunk->data.propCount; i++)
-                chunk->data.props[i] = ((int *)unpackedData)[1 + i];
+            chunk->data.props = (unsigned int *)RRES_CALLOC(propCount, sizeof(unsigned int));
+            memcpy(chunk->data.props, (unsigned char *)unpackedData + sizeof(propCount),
+                   propCount * sizeof(unsigned int));
         }
 
         void *raw = RRES_CALLOC(chunk->info.baseSize - 20, 1);
         memcpy(raw, ((unsigned char *)unpackedData) + 20, chunk->info.baseSize - 20);
         RRES_FREE(chunk->data.raw);
         chunk->data.raw = raw;
-        RL_FREE(unpackedData);
     }
+
+    // --- Free heap buffers safely ---
+    if (unpackedData && unpackedData != decryptedData)
+        RL_FREE(unpackedData);
+    if (decryptedData && decryptedData != chunk->data.raw)
+        RL_FREE(decryptedData);
 
     return result;
 }
