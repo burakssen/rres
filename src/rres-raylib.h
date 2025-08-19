@@ -528,66 +528,111 @@ Mesh LoadMeshFromResource(rresResourceMulti multi)
 // In case data could not be processed by rres.h, it is just copied in chunk.data.raw for processing here
 // NOTE 1: Function return 0 on success or an error code on failure
 // NOTE 2: Data corruption CRC32 check has already been performed by rresLoadResourceMulti() on rres.h
+// Unpack compressed/encrypted data from resource chunk
+// NOTE 1: Function returns 0 on success or an error code on failure
+// NOTE 2: Data corruption CRC32 check has already been performed by rresLoadResourceMulti() on rres.h
 int UnpackResourceChunk(rresResourceChunk *chunk)
 {
     int result = 0;
     bool updateProps = false;
     void *unpackedData = NULL;
-    unsigned char *decryptedData = NULL;
 
+    unsigned char *decryptedData = NULL;
+    bool decryptedAllocated = false;       // whether decryptedData was allocated by us
+    unsigned char *decompAllocated = NULL; // buffer returned by decompressor (if any)
+
+    if (!chunk)
+        return 4;
+
+    // --- Decryption ---
     switch (chunk->info.cipherType)
     {
     case RRES_CIPHER_NONE:
+        // encrypted data is actually raw data
         decryptedData = (unsigned char *)chunk->data.raw;
+        decryptedAllocated = false;
         break;
 
 #if defined(RRES_SUPPORT_ENCRYPTION_AES)
     case RRES_CIPHER_AES:
     {
-        if (chunk->info.packedSize <= 32)
-        {
-            result = 2; // not enough data
-            break;
-        }
+        const int saltSize = 16;
+        const int md5Size = 16;
 
         int totalSize = chunk->info.packedSize;
-        int saltSize = 16;
-        int md5Size = 16;
-        int dataSize = totalSize - saltSize - md5Size;
-
-        decryptedData = (unsigned char *)RL_CALLOC(dataSize, 1);
-        if (!decryptedData)
+        if (totalSize <= (saltSize + md5Size))
         {
-            result = 4; // allocation failed
+            result = 2; // not enough bytes for salt+md5 + ciphertext
             break;
         }
 
-        memcpy(decryptedData, chunk->data.raw, dataSize);
+        int dataSize = totalSize - saltSize - md5Size; // ciphertext length
+        if (dataSize <= 0)
+        {
+            result = 2;
+            break;
+        }
 
+        decryptedData = (unsigned char *)RL_CALLOC((size_t)dataSize, 1);
+        if (!decryptedData)
+        {
+            result = 4; // alloc failed
+            break;
+        }
+        decryptedAllocated = true;
+
+        // Copy ciphertext portion
+        memcpy(decryptedData, chunk->data.raw, (size_t)dataSize);
+
+        // Read salt (immediately after ciphertext)
         uint8_t salt[16];
-        memcpy(salt, ((unsigned char *)chunk->data.raw) + dataSize, saltSize);
+        memcpy(salt, ((unsigned char *)chunk->data.raw) + (size_t)dataSize, saltSize);
 
+        // Derive key with Argon2
         uint8_t key[32] = {0};
         crypto_argon2_config config = {CRYPTO_ARGON2_I, 16384, 3, 1};
         crypto_argon2_inputs inputs = {
-            (const uint8_t *)rresGetCipherPassword(), salt,
-            (uint32_t)strlen(rresGetCipherPassword()), saltSize};
+            (const uint8_t *)rresGetCipherPassword(),
+            salt,
+            (uint32_t)strlen(rresGetCipherPassword()),
+            (uint32_t)saltSize};
         crypto_argon2_extras extras = {0};
-        void *workArea = RL_MALLOC(config.nb_blocks * 1024);
+        void *workArea = RL_MALLOC((size_t)config.nb_blocks * 1024);
+        if (!workArea)
+        {
+            crypto_wipe(salt, saltSize);
+            RL_FREE(decryptedData);
+            decryptedData = NULL;
+            decryptedAllocated = false;
+            result = 4;
+            break;
+        }
         crypto_argon2(key, 32, workArea, config, inputs, extras);
         crypto_wipe(salt, saltSize);
         RL_FREE(workArea);
 
+        // Decrypt in-place (CTR)
         struct AES_ctx ctx;
         AES_init_ctx(&ctx, key);
-        AES_CTR_xcrypt_buffer(&ctx, decryptedData, dataSize);
-        crypto_wipe(key, 32);
+        AES_CTR_xcrypt_buffer(&ctx, decryptedData, (size_t)dataSize);
 
-        // Compare MD5 as raw bytes to avoid endianness issues
-        unsigned char *md5 = ((unsigned char *)chunk->data.raw) + dataSize + saltSize;
+        // Compute MD5 of decrypted data and compare against stored MD5 (raw bytes)
+        unsigned char *storedMD5 = ((unsigned char *)chunk->data.raw) + (size_t)dataSize + saltSize;
         unsigned char *computedMD5 = (unsigned char *)ComputeMD5(decryptedData, dataSize);
-        if (memcmp(computedMD5, md5, md5Size) == 0)
+
+        if (computedMD5 == NULL)
         {
+            crypto_wipe(key, sizeof(key));
+            RL_FREE(decryptedData);
+            decryptedData = NULL;
+            decryptedAllocated = false;
+            result = 4;
+            break;
+        }
+
+        if (memcmp(computedMD5, storedMD5, md5Size) == 0)
+        {
+            // success: shrink packedSize to plaintext ciphertext length (decrypted size)
             chunk->info.packedSize = dataSize;
             RRES_LOG("RRES: %c%c%c%c: Data decrypted successfully (AES)\n",
                      chunk->info.type[0], chunk->info.type[1],
@@ -595,55 +640,85 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         }
         else
         {
-            result = 2;
             RRES_LOG("RRES: WARNING: %c%c%c%c: Data decryption failed, wrong password or corrupted data\n",
                      chunk->info.type[0], chunk->info.type[1],
                      chunk->info.type[2], chunk->info.type[3]);
+            crypto_wipe(key, sizeof(key));
+            RL_FREE(decryptedData);
+            decryptedData = NULL;
+            decryptedAllocated = false;
+            result = 2;
+            break;
         }
+
+        crypto_wipe(key, sizeof(key));
     }
     break;
-#endif
+#endif // RRES_SUPPORT_ENCRYPTION_AES
 
 #if defined(RRES_SUPPORT_ENCRYPTION_XCHACHA20)
     case RRES_CIPHER_XCHACHA20_POLY1305:
     {
-        if (chunk->info.packedSize <= 56)
+        const int saltSize = 16;
+        const int nonceSize = 24;
+        const int macSize = 16;
+
+        int totalSize = chunk->info.packedSize;
+        if (totalSize <= (saltSize + nonceSize + macSize))
         {
             result = 2;
             break;
         }
 
-        int totalSize = chunk->info.packedSize;
-        int saltSize = 16;
-        int nonceSize = 24;
-        int macSize = 16;
-        int dataSize = totalSize - saltSize - nonceSize - macSize;
+        int dataSize = totalSize - saltSize - nonceSize - macSize; // ciphertext length
+        if (dataSize <= 0)
+        {
+            result = 2;
+            break;
+        }
 
-        decryptedData = (unsigned char *)RL_CALLOC(dataSize, 1);
+        decryptedData = (unsigned char *)RL_CALLOC((size_t)dataSize, 1);
         if (!decryptedData)
         {
             result = 4;
             break;
         }
+        decryptedAllocated = true;
 
+        // Read salt (immediately after ciphertext)
         uint8_t salt[16];
-        memcpy(salt, ((unsigned char *)chunk->data.raw) + dataSize, saltSize);
+        memcpy(salt, ((unsigned char *)chunk->data.raw) + (size_t)dataSize, saltSize);
 
+        // Argon2 -> key
         uint8_t key[32] = {0};
         crypto_argon2_config config = {CRYPTO_ARGON2_I, 16384, 3, 1};
         crypto_argon2_inputs inputs = {
-            (const uint8_t *)rresGetCipherPassword(), salt,
-            (uint32_t)strlen(rresGetCipherPassword()), saltSize};
+            (const uint8_t *)rresGetCipherPassword(),
+            salt,
+            (uint32_t)strlen(rresGetCipherPassword()),
+            (uint32_t)saltSize};
         crypto_argon2_extras extras = {0};
-        void *workArea = RL_MALLOC(config.nb_blocks * 1024);
+        void *workArea = RL_MALLOC((size_t)config.nb_blocks * 1024);
+        if (!workArea)
+        {
+            crypto_wipe(salt, saltSize);
+            RL_FREE(decryptedData);
+            decryptedData = NULL;
+            decryptedAllocated = false;
+            result = 4;
+            break;
+        }
         crypto_argon2(key, 32, workArea, config, inputs, extras);
         crypto_wipe(salt, saltSize);
         RL_FREE(workArea);
 
-        uint8_t nonce[24], mac[16];
-        memcpy(nonce, ((unsigned char *)chunk->data.raw) + dataSize + saltSize, nonceSize);
-        memcpy(mac, ((unsigned char *)chunk->data.raw) + dataSize + saltSize + nonceSize, macSize);
+        // nonce and mac follow salt
+        uint8_t nonce[24];
+        uint8_t mac[16];
+        memcpy(nonce, ((unsigned char *)chunk->data.raw) + (size_t)dataSize + saltSize, nonceSize);
+        memcpy(mac, ((unsigned char *)chunk->data.raw) + (size_t)dataSize + saltSize + nonceSize, macSize);
 
+        // decrypt: ciphertext is at chunk->data.raw[0..dataSize-1]
         int decryptResult = crypto_aead_unlock(decryptedData, mac, key, nonce, NULL, 0,
                                                (unsigned char *)chunk->data.raw, dataSize);
         crypto_wipe(nonce, nonceSize);
@@ -658,21 +733,104 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         }
         else
         {
-            result = 2;
             RRES_LOG("RRES: WARNING: %c%c%c%c: Data decryption failed, wrong password or corrupted data\n",
                      chunk->info.type[0], chunk->info.type[1],
                      chunk->info.type[2], chunk->info.type[3]);
+            RL_FREE(decryptedData);
+            decryptedData = NULL;
+            decryptedAllocated = false;
+            result = 2;
+            break;
         }
     }
     break;
-#endif
+#endif // RRES_SUPPORT_ENCRYPTION_XCHACHA20
 
     default:
-        result = 1;
+        result = 1; // unsupported cipher
         RRES_LOG("RRES: WARNING: %c%c%c%c: Chunk data encryption algorithm not supported\n",
                  chunk->info.type[0], chunk->info.type[1],
                  chunk->info.type[2], chunk->info.type[3]);
         break;
+    } // end switch cipherType
+
+    if ((result == 0) && (chunk->info.cipherType != RRES_CIPHER_NONE))
+    {
+        // mark cipher removed
+        chunk->info.cipherType = RRES_CIPHER_NONE;
+        updateProps = true;
+    }
+
+    // --- Decompression ---
+    unsigned char *uncompData = NULL;
+    if (result == 0)
+    {
+        switch (chunk->info.compType)
+        {
+        case RRES_COMP_NONE:
+            // no compression; decryptedData points to plaintext
+            unpackedData = decryptedData;
+            break;
+
+        case RRES_COMP_DEFLATE:
+        {
+            int uncompDataSize = 0;
+            // Pass the current packedSize (which should be ciphertext length if we decrypted successfully,
+            // or the original packedSize if no decryption).
+            uncompData = DecompressData(decryptedData, chunk->info.packedSize, &uncompDataSize);
+            if (uncompData && (uncompDataSize > 0))
+            {
+                unpackedData = uncompData;
+                decompAllocated = uncompData;
+                chunk->info.packedSize = uncompDataSize;
+                RRES_LOG("RRES: %c%c%c%c: Data decompressed successfully (DEFLATE)\n",
+                         chunk->info.type[0], chunk->info.type[1],
+                         chunk->info.type[2], chunk->info.type[3]);
+            }
+            else
+            {
+                result = 4; // decompression failed
+            }
+        }
+        break;
+
+#if defined(RRES_SUPPORT_COMPRESSION_LZ4)
+        case RRES_COMP_LZ4:
+        {
+            int expectedSize = chunk->info.baseSize;
+            if (expectedSize <= 0)
+            {
+                result = 4;
+                break;
+            }
+            uncompData = (unsigned char *)RRES_CALLOC((size_t)expectedSize, 1);
+            if (!uncompData)
+            {
+                result = 4;
+                break;
+            }
+            int outSize = LZ4_decompress_safe((char *)decryptedData, (char *)uncompData,
+                                              chunk->info.packedSize, chunk->info.baseSize);
+            if (outSize > 0)
+            {
+                unpackedData = uncompData;
+                decompAllocated = uncompData;
+                chunk->info.packedSize = outSize;
+            }
+            else
+            {
+                RRES_FREE(uncompData);
+                uncompData = NULL;
+                result = 4;
+            }
+        }
+        break;
+#endif // RRES_SUPPORT_COMPRESSION_LZ4
+
+        default:
+            result = 3; // unsupported compression
+            break;
+        }
     }
 
     if ((result == 0) && (chunk->info.compType != RRES_COMP_NONE))
@@ -681,31 +839,119 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         updateProps = true;
     }
 
-    // --- Update props ---
+    // --- Update properties & replace raw data buffer if needed ---
     if (updateProps && unpackedData)
     {
-        unsigned int propCount = 0;
-        memcpy(&propCount, unpackedData, sizeof(propCount));
-        chunk->data.propCount = propCount;
-
-        if (propCount > 0)
+        // Unpacked data layout (assumed): [propCount (uint32)] [props... (uint32 * propCount)] [payload...]
+        // Ensure there is at least space for propCount
+        if (chunk->info.packedSize < (int)sizeof(unsigned int))
         {
-            chunk->data.props = (unsigned int *)RRES_CALLOC(propCount, sizeof(unsigned int));
-            memcpy(chunk->data.props, (unsigned char *)unpackedData + sizeof(propCount),
-                   propCount * sizeof(unsigned int));
+            result = 4;
         }
+        else
+        {
+            unsigned int propCount = 0;
+            memcpy(&propCount, unpackedData, sizeof(propCount));
+            chunk->data.propCount = propCount;
 
-        void *raw = RRES_CALLOC(chunk->info.baseSize - 20, 1);
-        memcpy(raw, ((unsigned char *)unpackedData) + 20, chunk->info.baseSize - 20);
-        RRES_FREE(chunk->data.raw);
-        chunk->data.raw = raw;
+            size_t propsBytes = (size_t)propCount * sizeof(unsigned int);
+            size_t headerSize = sizeof(unsigned int) + propsBytes;
+
+            // Safeguard: ensure headerSize + at least 1 byte of payload does not exceed baseSize
+            if ((chunk->info.baseSize >= 20) &&
+                ((size_t)chunk->info.baseSize >= 20 + headerSize))
+            {
+                if (propCount > 0)
+                {
+                    chunk->data.props = (unsigned int *)RRES_CALLOC((size_t)propCount, sizeof(unsigned int));
+                    if (chunk->data.props)
+                    {
+                        memcpy(chunk->data.props, (unsigned char *)unpackedData + sizeof(unsigned int), propsBytes);
+                    }
+                    else
+                    {
+                        result = 4;
+                    }
+                }
+
+                // Copy remaining payload into chunk->data.raw
+                size_t payloadSize = (size_t)chunk->info.baseSize - 20;
+                void *raw = RRES_CALLOC(payloadSize, 1);
+                if (!raw)
+                {
+                    result = 4;
+                }
+                else
+                {
+                    memcpy(raw, ((unsigned char *)unpackedData) + 20, payloadSize);
+
+                    // free old raw and replace
+                    if (chunk->data.raw)
+                        RRES_FREE(chunk->data.raw);
+                    chunk->data.raw = raw;
+                }
+            }
+            else
+            {
+                // If baseSize doesn't match assumptions, try a safer fallback:
+                // If unpackedData contains at least headerSize bytes, copy what we can.
+                if ((size_t)chunk->info.packedSize >= headerSize + 1)
+                {
+                    if (propCount > 0)
+                    {
+                        chunk->data.props = (unsigned int *)RRES_CALLOC((size_t)propCount, sizeof(unsigned int));
+                        if (chunk->data.props)
+                        {
+                            memcpy(chunk->data.props, (unsigned char *)unpackedData + sizeof(unsigned int), propsBytes);
+                        }
+                        else
+                        {
+                            result = 4;
+                        }
+                    }
+
+                    size_t payloadSize = ((size_t)chunk->info.packedSize) - headerSize;
+                    void *raw = RRES_CALLOC(payloadSize, 1);
+                    if (!raw)
+                    {
+                        result = 4;
+                    }
+                    else
+                    {
+                        memcpy(raw, (unsigned char *)unpackedData + headerSize, payloadSize);
+                        if (chunk->data.raw)
+                            RRES_FREE(chunk->data.raw);
+                        chunk->data.raw = raw;
+                    }
+                }
+                else
+                {
+                    // not enough data
+                    result = 4;
+                }
+            }
+        }
     }
 
-    // --- Free heap buffers safely ---
-    if (unpackedData && unpackedData != decryptedData)
-        RL_FREE(unpackedData);
-    if (decryptedData && decryptedData != chunk->data.raw)
+    // --- Free allocated buffers safely ---
+    // If we allocated decryptedData ourselves, free it (but not if it's pointing into chunk->data.raw)
+    if (decryptedAllocated && decryptedData)
+    {
         RL_FREE(decryptedData);
+        decryptedData = NULL;
+        decryptedAllocated = false;
+    }
+
+    // If decompressor returned separate buffer, free it (unpackedData points to it)
+    if (decompAllocated && decompAllocated != NULL)
+    {
+        // If we used decompAllocated as unpackedData (and we already copied its contents into chunk->data.raw),
+        // free it now.
+        RL_FREE(decompAllocated);
+        decompAllocated = NULL;
+    }
+
+    // Note: do NOT free chunk->data.raw here (it is the active buffer assigned to the chunk)
 
     return result;
 }
