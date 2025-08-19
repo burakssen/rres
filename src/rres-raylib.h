@@ -549,9 +549,9 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         {
             result = 2;
             break;
-        } // sanity check
+        }
 
-        int dataSize = chunk->info.packedSize - 32; // remove salt + MD5
+        int dataSize = chunk->info.packedSize - 32;
         decryptedData = (unsigned char *)RL_CALLOC(dataSize, 1);
         if (!decryptedData)
         {
@@ -584,8 +584,7 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
         crypto_wipe(key, 32);
 
         unsigned int decryptMD5[4];
-        unsigned int *md5Ptr = ComputeMD5(decryptedData, dataSize);
-        memcpy(decryptMD5, md5Ptr, sizeof(decryptMD5));
+        ComputeMD5(decryptedData, dataSize, decryptMD5); // Corrected function call
 
         if (memcmp(decryptMD5, md5, sizeof(md5)) == 0)
         {
