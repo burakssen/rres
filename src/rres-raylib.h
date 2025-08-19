@@ -528,8 +528,6 @@ Mesh LoadMeshFromResource(rresResourceMulti multi)
 // In case data could not be processed by rres.h, it is just copied in chunk.data.raw for processing here
 // NOTE 1: Function return 0 on success or an error code on failure
 // NOTE 2: Data corruption CRC32 check has already been performed by rresLoadResourceMulti() on rres.h
-// Unpack compressed/encrypted data from resource chunk
-// Returns 0 on success, error code on failure
 int UnpackResourceChunk(rresResourceChunk *chunk)
 {
     int result = 0;
@@ -537,7 +535,6 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
     void *unpackedData = NULL;
     unsigned char *decryptedData = NULL;
 
-    // --- Decryption ---
     switch (chunk->info.cipherType)
     {
     case RRES_CIPHER_NONE:
@@ -549,46 +546,47 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
     {
         if (chunk->info.packedSize <= 32)
         {
-            result = 2;
+            result = 2; // not enough data
             break;
-        } // sanity
+        }
 
-        int dataSize = chunk->info.packedSize - 32;
+        int totalSize = chunk->info.packedSize;
+        int saltSize = 16;
+        int md5Size = 16;
+        int dataSize = totalSize - saltSize - md5Size;
+
         decryptedData = (unsigned char *)RL_CALLOC(dataSize, 1);
         if (!decryptedData)
         {
-            result = 4;
+            result = 4; // allocation failed
             break;
         }
 
         memcpy(decryptedData, chunk->data.raw, dataSize);
 
-        uint8_t key[32] = {0};
         uint8_t salt[16];
-        memcpy(salt, ((unsigned char *)chunk->data.raw) + dataSize, 16);
+        memcpy(salt, ((unsigned char *)chunk->data.raw) + dataSize, saltSize);
 
+        uint8_t key[32] = {0};
         crypto_argon2_config config = {CRYPTO_ARGON2_I, 16384, 3, 1};
-        crypto_argon2_inputs inputs = {(const uint8_t *)rresGetCipherPassword(), salt,
-                                       (uint32_t)strlen(rresGetCipherPassword()), 16};
+        crypto_argon2_inputs inputs = {
+            (const uint8_t *)rresGetCipherPassword(), salt,
+            (uint32_t)strlen(rresGetCipherPassword()), saltSize};
         crypto_argon2_extras extras = {0};
         void *workArea = RL_MALLOC(config.nb_blocks * 1024);
         crypto_argon2(key, 32, workArea, config, inputs, extras);
-        crypto_wipe(salt, 16);
+        crypto_wipe(salt, saltSize);
         RL_FREE(workArea);
-
-        unsigned int md5[4];
-        memcpy(md5, ((unsigned char *)chunk->data.raw) + dataSize + 16, sizeof(md5));
 
         struct AES_ctx ctx;
         AES_init_ctx(&ctx, key);
         AES_CTR_xcrypt_buffer(&ctx, decryptedData, dataSize);
         crypto_wipe(key, 32);
 
-        unsigned int decryptMD5[4];
-        unsigned int *md5Ptr = ComputeMD5(decryptedData, dataSize);
-        memcpy(decryptMD5, md5Ptr, sizeof(decryptMD5));
-
-        if (memcmp(decryptMD5, md5, sizeof(md5)) == 0)
+        // Compare MD5 as raw bytes to avoid endianness issues
+        unsigned char *md5 = ((unsigned char *)chunk->data.raw) + dataSize + saltSize;
+        unsigned char *computedMD5 = (unsigned char *)ComputeMD5(decryptedData, dataSize);
+        if (memcmp(computedMD5, md5, md5Size) == 0)
         {
             chunk->info.packedSize = dataSize;
             RRES_LOG("RRES: %c%c%c%c: Data decrypted successfully (AES)\n",
@@ -615,7 +613,12 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
             break;
         }
 
-        int dataSize = chunk->info.packedSize - 16 - 24 - 16;
+        int totalSize = chunk->info.packedSize;
+        int saltSize = 16;
+        int nonceSize = 24;
+        int macSize = 16;
+        int dataSize = totalSize - saltSize - nonceSize - macSize;
+
         decryptedData = (unsigned char *)RL_CALLOC(dataSize, 1);
         if (!decryptedData)
         {
@@ -623,26 +626,27 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
             break;
         }
 
-        uint8_t key[32] = {0};
         uint8_t salt[16];
-        memcpy(salt, ((unsigned char *)chunk->data.raw) + dataSize, 16);
+        memcpy(salt, ((unsigned char *)chunk->data.raw) + dataSize, saltSize);
 
+        uint8_t key[32] = {0};
         crypto_argon2_config config = {CRYPTO_ARGON2_I, 16384, 3, 1};
-        crypto_argon2_inputs inputs = {(const uint8_t *)rresGetCipherPassword(), salt,
-                                       (uint32_t)strlen(rresGetCipherPassword()), 16};
+        crypto_argon2_inputs inputs = {
+            (const uint8_t *)rresGetCipherPassword(), salt,
+            (uint32_t)strlen(rresGetCipherPassword()), saltSize};
         crypto_argon2_extras extras = {0};
         void *workArea = RL_MALLOC(config.nb_blocks * 1024);
         crypto_argon2(key, 32, workArea, config, inputs, extras);
-        crypto_wipe(salt, 16);
+        crypto_wipe(salt, saltSize);
         RL_FREE(workArea);
 
         uint8_t nonce[24], mac[16];
-        memcpy(nonce, ((unsigned char *)chunk->data.raw) + dataSize + 16, 24);
-        memcpy(mac, ((unsigned char *)chunk->data.raw) + dataSize + 16 + 24, 16);
+        memcpy(nonce, ((unsigned char *)chunk->data.raw) + dataSize + saltSize, nonceSize);
+        memcpy(mac, ((unsigned char *)chunk->data.raw) + dataSize + saltSize + nonceSize, macSize);
 
         int decryptResult = crypto_aead_unlock(decryptedData, mac, key, nonce, NULL, 0,
                                                (unsigned char *)chunk->data.raw, dataSize);
-        crypto_wipe(nonce, 24);
+        crypto_wipe(nonce, nonceSize);
         crypto_wipe(key, 32);
 
         if (decryptResult == 0)
@@ -669,62 +673,6 @@ int UnpackResourceChunk(rresResourceChunk *chunk)
                  chunk->info.type[0], chunk->info.type[1],
                  chunk->info.type[2], chunk->info.type[3]);
         break;
-    }
-
-    if ((result == 0) && (chunk->info.cipherType != RRES_CIPHER_NONE))
-    {
-        chunk->info.cipherType = RRES_CIPHER_NONE;
-        updateProps = true;
-    }
-
-    // --- Decompression ---
-    unsigned char *uncompData = NULL;
-    if (result == 0)
-    {
-        switch (chunk->info.compType)
-        {
-        case RRES_COMP_NONE:
-            unpackedData = decryptedData;
-            break;
-
-        case RRES_COMP_DEFLATE:
-        {
-            int uncompDataSize = 0;
-            uncompData = DecompressData(decryptedData, chunk->info.packedSize, &uncompDataSize);
-            if (uncompData && uncompDataSize > 0)
-            {
-                unpackedData = uncompData;
-                chunk->info.packedSize = uncompDataSize;
-                RRES_LOG("RRES: %c%c%c%c: Data decompressed successfully (DEFLATE)\n",
-                         chunk->info.type[0], chunk->info.type[1],
-                         chunk->info.type[2], chunk->info.type[3]);
-            }
-            else
-                result = 4;
-        }
-        break;
-
-#if defined(RRES_SUPPORT_COMPRESSION_LZ4)
-        case RRES_COMP_LZ4:
-        {
-            int uncompDataSize = chunk->info.baseSize;
-            uncompData = (unsigned char *)RRES_CALLOC(uncompDataSize, 1);
-            uncompDataSize = LZ4_decompress_safe((char *)decryptedData, (char *)uncompData,
-                                                 chunk->info.packedSize, chunk->info.baseSize);
-            if (uncompData && uncompDataSize > 0)
-            {
-                unpackedData = uncompData;
-                chunk->info.packedSize = uncompDataSize;
-            }
-            else
-                result = 4;
-        }
-        break;
-#endif
-        default:
-            result = 3;
-            break;
-        }
     }
 
     if ((result == 0) && (chunk->info.compType != RRES_COMP_NONE))
